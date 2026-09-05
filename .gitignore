@@ -13,6 +13,7 @@
 # CMake build artifacts
 build/
 build.nosync/
+build-deletion-experiment/
 cmake_install.cmake
 CMakeCache.txt
 CTestTestfile.cmake
@@ -23,6 +24,7 @@ CPackConfig.cmake
 CPackSourceConfig.cmake
 compile_commands.json
 Testing/
+benchmark-results/
 
 # macOS
 .DS_Store

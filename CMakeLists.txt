@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(AuditStrategyTemplate VERSION 1.0 LANGUAGES CXX)
+project(TEESecureDeletion VERSION 1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -12,7 +12,11 @@ option(CAM_BUILD_TESTS "Build tests" OFF)
 option(CAM_GENERATE_DOCS "Generate Doxygen documentation" OFF)
 
 # ==================== CoreLib Dependency ====================
+# Keep this plugin's test switch from enabling CoreLib's own test suite.
+set(TEE_SECURE_DELETION_BUILD_TESTS ${CAM_BUILD_TESTS})
+set(CAM_BUILD_TESTS OFF)
 add_subdirectory(3rdparty/CoreLib EXCLUDE_FROM_ALL)
+set(CAM_BUILD_TESTS ${TEE_SECURE_DELETION_BUILD_TESTS})
 
 # ==================== Sanitizer ====================
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
@@ -44,14 +48,44 @@ endif()
 
 # ==================== Strategy Shared Library ====================
 set(SOURCE
-  source/new_audit_strategy.cpp
+  source/strategy.cpp
+  3rdparty/SM9StaticAuditStrategy/source/artifact_factory.cpp
+  3rdparty/SM9StaticAuditStrategy/source/common.cpp
+  3rdparty/SM9StaticAuditStrategy/source/challenges.cpp
+  3rdparty/SM9StaticAuditStrategy/source/generate_challenges.cpp
+  3rdparty/SM9StaticAuditStrategy/source/generate_keys.cpp
+  3rdparty/SM9StaticAuditStrategy/source/generate_proofs.cpp
+  3rdparty/SM9StaticAuditStrategy/source/generate_tags.cpp
+  3rdparty/SM9StaticAuditStrategy/source/initialize_algorithm.cpp
+  3rdparty/SM9StaticAuditStrategy/source/proves.cpp
+  3rdparty/SM9StaticAuditStrategy/source/tags.cpp
+  3rdparty/DHTDynamicAuditStrategy/source/state_stores/dynamic_hash_table_state_store.cpp
+  3rdparty/DHTDynamicAuditStrategy/source/state_stores/versioned_block_metadata.cpp
 )
 
 add_library(${PROJECT_NAME} SHARED ${SOURCE})
 target_link_libraries(${PROJECT_NAME} PRIVATE ChordAuditMatrixLib)
-target_include_directories(${PROJECT_NAME} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_include_directories(${PROJECT_NAME} PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/SM9StaticAuditStrategy/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/DHTDynamicAuditStrategy/include)
+
+if(CAM_BUILD_TESTS)
+    enable_testing()
+    add_executable(TEESecureDeletionAuditStrategyTests
+        tests/tee_secure_deletion_strategy_tests.cpp)
+    target_link_libraries(TEESecureDeletionAuditStrategyTests
+        PRIVATE ${PROJECT_NAME} ChordAuditMatrixLib)
+    add_test(NAME TEESecureDeletionAuditStrategyTests
+        COMMAND TEESecureDeletionAuditStrategyTests)
+    add_executable(TEESecureDeletionExperiment
+        tests/assured_deletion_experiment.cpp)
+    target_link_libraries(TEESecureDeletionExperiment
+        PRIVATE ${PROJECT_NAME} ChordAuditMatrixLib)
+endif()
 
 set_target_properties(${PROJECT_NAME} PROPERTIES
+    PREFIX ""
     VERSION ${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR}
     SOVERSION ${PROJECT_VERSION_MAJOR}
 )
