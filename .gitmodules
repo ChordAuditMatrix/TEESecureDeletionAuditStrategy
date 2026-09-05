@@ -2,9 +2,3 @@
 [submodule "3rdparty/CoreLib"]
 	path = 3rdparty/CoreLib
 	url = git@github.com:ChordAuditMatrix/CoreLib.git
-[submodule "3rdparty/SM9StaticAuditStrategy"]
-	path = 3rdparty/SM9StaticAuditStrategy
-	url = https://github.com/ChordAuditMatrix/SM9StaticAuditStrategy.git
-[submodule "3rdparty/DHTDynamicAuditStrategy"]
-	path = 3rdparty/DHTDynamicAuditStrategy
-	url = https://github.com/ChordAuditMatrix/DHTDynamicAuditStrategy.git

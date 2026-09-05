@@ -1,17 +1,17 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Native CoreLib lifecycle for the TEE deletion construction. */
 #include "TEESecureDeletionAuditStrategy/strategy.h"
+#include "TEESecureDeletionAuditStrategy/deletion_state_store.h"
 
+#include "ChordAuditMatrixLib/implementations/crypto/sm9/gt_element.h"
+#include "ChordAuditMatrixLib/implementations/crypto/sm9/points.h"
+#include "ChordAuditMatrixLib/implementations/crypto/sm9_noncert/hash_utils.h"
+#include "ChordAuditMatrixLib/interfaces/audit/artifact_factory.h"
 #include "ChordAuditMatrixLib/interfaces/audit/messages/audit_data_map.h"
 #include "ChordAuditMatrixLib/interfaces/audit/messages/in_memory_tags.h"
-#include "DHTDynamicAuditStrategy/state_stores/dynamic_hash_table_state_store.h"
-#include "SM9StaticAuditStrategy/artifact_factory.h"
-#include "SM9StaticAuditStrategy/challenges.h"
-#include "SM9StaticAuditStrategy/common.h"
-#include "SM9StaticAuditStrategy/proves.h"
-#include "SM9StaticAuditStrategy/tags.h"
 
 #include <algorithm>
+#include <cereal/archives/binary.hpp>
 #include <json/json.h>
 #include <map>
 #include <numeric>
@@ -23,7 +23,10 @@ namespace CAMatrix::Audit::Strategies {
 namespace {
 using namespace CAMatrix::Audit::Core;
 using namespace CAMatrix::Audit::Messages;
-using namespace CAMatrix::Audit::SM9Static;
+using SM9CryptoData = CAMatrix::Crypto::SM9::SM9CryptoData;
+using G1Point = CAMatrix::Crypto::SM9::G1Point;
+using G2Point = CAMatrix::Crypto::SM9::G2Point;
+using SM9GTElement = CAMatrix::Crypto::SM9::SM9GTElement;
 
 class TeeSystemPublic final : public AlgoPublicParams {
 public:
@@ -50,6 +53,152 @@ public:
 protected:
   void do_serialize(cereal::BinaryOutputArchive &) const override {}
   void do_deserialize(cereal::BinaryInputArchive &) override {}
+};
+
+class TeeTag final : public Tag {
+public:
+  TeeTag() : value(std::make_shared<G1Point>()) { value->setInfinity(); }
+  explicit TeeTag(std::shared_ptr<G1Point> point) : value(std::move(point)) {}
+
+  void assign(const Tag &other) override {
+    const auto *typed = dynamic_cast<const TeeTag *>(&other);
+    if (!typed)
+      throw std::runtime_error("TEE tag type mismatch");
+    value = typed->value;
+  }
+
+  std::shared_ptr<Tag> operator+(const Tag &other) const override {
+    const auto *typed = dynamic_cast<const TeeTag *>(&other);
+    if (!typed)
+      throw std::runtime_error("TEE tag type mismatch");
+    return std::make_shared<TeeTag>(
+        std::static_pointer_cast<G1Point>(*value + *typed->value));
+  }
+
+  bool operator==(const Tag &other) const override {
+    const auto *typed = dynamic_cast<const TeeTag *>(&other);
+    return typed && value && typed->value && *value == *typed->value;
+  }
+
+  std::shared_ptr<G1Point> value;
+
+protected:
+  void do_serialize(cereal::BinaryOutputArchive &archive) const override {
+    const bool present = static_cast<bool>(value);
+    archive(present);
+    if (present) {
+      const auto raw = value->toRawStruct();
+      archive(cereal::binary_data(&raw, sizeof(raw)));
+    }
+  }
+
+  void do_deserialize(cereal::BinaryInputArchive &archive) override {
+    bool present = false;
+    archive(present);
+    if (!present) {
+      value.reset();
+      return;
+    }
+    CAMatrix::Crypto::SM9::SM9PointData raw;
+    archive(cereal::binary_data(&raw, sizeof(raw)));
+    value = std::make_shared<G1Point>();
+    value->setValue(raw);
+  }
+};
+
+class TeeChallenges final : public Challenges {
+public:
+  struct Item {
+    std::size_t index = 0;
+    SM9CryptoData coefficient;
+  };
+  std::vector<Item> items;
+  std::size_t blockCount = 0;
+  std::size_t challengeCount = 0;
+  std::uint64_t seed = 0;
+
+protected:
+  void do_serialize(cereal::BinaryOutputArchive &archive) const override {
+    archive(blockCount, challengeCount, seed);
+    const auto count = items.size();
+    archive(count);
+    for (const auto &item : items) {
+      archive(item.index, cereal::binary_data(item.coefficient.data(),
+                                              item.coefficient.size()));
+    }
+  }
+
+  void do_deserialize(cereal::BinaryInputArchive &archive) override {
+    archive(blockCount, challengeCount, seed);
+    std::size_t count = 0;
+    archive(count);
+    items.resize(count);
+    for (auto &item : items) {
+      archive(item.index, cereal::binary_data(item.coefficient.data(),
+                                              item.coefficient.size()));
+    }
+  }
+};
+
+class TeeProof final : public Proves {
+public:
+  SM9CryptoData muHat;
+  std::shared_ptr<TeeTag> sigma;
+
+protected:
+  void do_serialize(cereal::BinaryOutputArchive &archive) const override {
+    archive(cereal::binary_data(muHat.data(), muHat.size()));
+    const bool present = sigma && sigma->value;
+    archive(present);
+    if (present) {
+      const auto raw = sigma->value->toRawStruct();
+      archive(cereal::binary_data(&raw, sizeof(raw)));
+    }
+  }
+
+  void do_deserialize(cereal::BinaryInputArchive &archive) override {
+    archive(cereal::binary_data(muHat.data(), muHat.size()));
+    bool present = false;
+    archive(present);
+    if (!present) {
+      sigma.reset();
+      return;
+    }
+    CAMatrix::Crypto::SM9::SM9PointData raw;
+    archive(cereal::binary_data(&raw, sizeof(raw)));
+    auto point = std::make_shared<G1Point>();
+    point->setValue(raw);
+    sigma = std::make_shared<TeeTag>(std::move(point));
+  }
+};
+
+class TeeArtifactFactory final : public AuditStrategyArtifactFactory {
+public:
+  AuditArtifactVariant createArtifact(AuditArtifactKind kind) const override {
+    switch (kind) {
+    case AuditArtifactKind::AlgorithmPublicParams:
+      return std::static_pointer_cast<AlgoPublicParams>(
+          std::make_shared<TeeSystemPublic>());
+    case AuditArtifactKind::UserPublicParams:
+      return std::static_pointer_cast<AlgoPublicParams>(
+          std::make_shared<TeeUserPublic>());
+    case AuditArtifactKind::UserPrivateParams:
+      return std::static_pointer_cast<AlgoPrivateParams>(
+          std::make_shared<TeeUserPrivate>());
+    case AuditArtifactKind::Tag:
+      return std::static_pointer_cast<Tag>(std::make_shared<TeeTag>());
+    case AuditArtifactKind::Challenges:
+      return std::static_pointer_cast<Challenges>(
+          std::make_shared<TeeChallenges>());
+    case AuditArtifactKind::Proves:
+      return std::static_pointer_cast<Proves>(std::make_shared<TeeProof>());
+    case AuditArtifactKind::DynamicBlockMetadata:
+      return std::static_pointer_cast<BlockMetadata>(
+          std::make_shared<TEEDeletion::DeletionBlockMetadata>());
+    default:
+      throw std::runtime_error("unsupported TEE artifact kind");
+    }
+  }
 };
 struct TeeTagsExt final : StageExtBase {
   std::string fileId;
@@ -86,6 +235,21 @@ struct NativeDeletionFile {
 };
 std::map<std::string, NativeDeletionFile> files;
 std::string activeFileId;
+
+SM9CryptoData hashBlockToScalar(const CAMatrix::Crypto::CryptoArray &payload) {
+  SM9CryptoData value;
+  value.mapToField(payload);
+  return value;
+}
+
+G1Point computeBlockHash(const std::string &fileId, std::size_t blockIndex) {
+  CAMatrix::Crypto::CryptoArray data;
+  data.insert(data.end(), fileId.begin(), fileId.end());
+  for (int shift = 56; shift >= 0; shift -= 8) {
+    data.push_back(static_cast<std::uint8_t>((blockIndex >> shift) & 0xffU));
+  }
+  return CAMatrix::Crypto::SM9Noncert::hashBlock(data);
+}
 
 SM9CryptoData hashScalar(const std::string &text) {
   SM9CryptoData x;
@@ -137,8 +301,9 @@ TEESecureDeletionAuditStrategy::stateMaintenanceParty() const {
   return StateMaintenanceParty::Shared;
 }
 std::shared_ptr<DynamicPdpStateStore>
-TEESecureDeletionAuditStrategy::createStateStore(BlockMetadataFactory) const {
-  return std::make_shared<DHTDynamic::DynamicHashTableStateStore>();
+TEESecureDeletionAuditStrategy::createStateStore(
+    BlockMetadataFactory factory) const {
+  return std::make_shared<TEEDeletion::DeletionStateStore>(std::move(factory));
 }
 void TEESecureDeletionAuditStrategy::setAlgorithm(
     CAMatrix::Crypto::CryptoGeneralAlgorithmPtr algorithm) {
@@ -146,7 +311,7 @@ void TEESecureDeletionAuditStrategy::setAlgorithm(
 }
 const AuditStrategyArtifactFactory &
 TEESecureDeletionAuditStrategy::artifactFactory() const {
-  static SM9StaticAuditArtifactFactory factory;
+  static TeeArtifactFactory factory;
   return factory;
 }
 
@@ -179,8 +344,8 @@ TEESecureDeletionAuditStrategy::generateTags(const GenerateTagsRequest &input) {
   auto ext = std::dynamic_pointer_cast<TeeTagsExt>(input.ext);
   if (!ext || !input.blocks || !ext->system || !ext->priv)
     return out;
-  auto tags = std::make_shared<InMemoryTags>(
-      [] { return std::make_shared<SM9StaticTag>(); });
+  auto tags =
+      std::make_shared<InMemoryTags>([] { return std::make_shared<TeeTag>(); });
   NativeDeletionFile file;
   for (std::size_t offset = 0; offset < input.blocks->availableBlockCount();
        ++offset) {
@@ -188,7 +353,7 @@ TEESecureDeletionAuditStrategy::generateTags(const GenerateTagsRequest &input) {
         CAMatrix::Crypto::CryptoArray(input.blocks->block(offset)));
     const auto msg = add(computeBlockHash(ext->fileId, offset + 1),
                          mul(ext->system->u, value));
-    tags->set(offset, std::make_shared<SM9StaticTag>(
+    tags->set(offset, std::make_shared<TeeTag>(
                           std::make_shared<G1Point>(mul(msg, ext->priv->sk1))));
     file.values.push_back(value);
   }
@@ -214,7 +379,7 @@ TEESecureDeletionAuditStrategy::maintenance(const MaintainRequest &input) {
   file.preDeleteTags.clear();
   for (std::size_t offset = 0; offset < file.values.size(); ++offset) {
     const auto previous =
-        std::dynamic_pointer_cast<SM9StaticTag>(file.tags->getByIndex(offset));
+        std::dynamic_pointer_cast<TeeTag>(file.tags->getByIndex(offset));
     file.preDeleteTags.push_back(*previous->value);
   }
   const auto seed =
@@ -231,8 +396,8 @@ TEESecureDeletionAuditStrategy::maintenance(const MaintainRequest &input) {
     const auto sigma = add(add(sigmaSeed, mul(R, r)),
                            mul(h2(ext->fileId, index, od), ext->priv->sk2));
     file.values[off] = od;
-    file.tags->set(
-        off, std::make_shared<SM9StaticTag>(std::make_shared<G1Point>(sigma)));
+    file.tags->set(off,
+                   std::make_shared<TeeTag>(std::make_shared<G1Point>(sigma)));
     if (std::find(file.deletedIndices.begin(), file.deletedIndices.end(),
                   index) == file.deletedIndices.end())
       file.deletedIndices.push_back(index);
@@ -258,12 +423,12 @@ GenerateChallengesResult TEESecureDeletionAuditStrategy::generateChallenges(
   selected.resize(std::min(selected.size(), ext->challengeCount
                                                 ? ext->challengeCount
                                                 : selected.size()));
-  auto q = std::make_shared<SM9StaticChallenges>();
+  auto q = std::make_shared<TeeChallenges>();
   q->blockCount = found->second.values.size();
   q->challengeCount = selected.size();
   q->seed = ext->seed;
   for (const auto index : selected) {
-    SM9StaticChallenges::Item item;
+    TeeChallenges::Item item;
     item.index = index;
     item.coefficient.setOne();
     q->items.push_back(item);
@@ -276,7 +441,7 @@ GenerateProofsResult TEESecureDeletionAuditStrategy::generateProofs(
     const GenerateProofsRequest &input) {
   GenerateProofsResult out;
   auto ext = std::dynamic_pointer_cast<TeeProofExt>(input.ext);
-  auto q = std::dynamic_pointer_cast<SM9StaticChallenges>(input.challenges);
+  auto q = std::dynamic_pointer_cast<TeeChallenges>(input.challenges);
   if (!ext || !q || q->items.empty())
     return out;
   const auto found = files.find(ext->fileId);
@@ -284,7 +449,7 @@ GenerateProofsResult TEESecureDeletionAuditStrategy::generateProofs(
     return out;
   const auto &file = found->second;
   SM9CryptoData M;
-  std::shared_ptr<SM9StaticTag> omega;
+  std::shared_ptr<TeeTag> omega;
   for (const auto &item : q->items) {
     if (item.index == 0 || item.index > file.values.size())
       return out;
@@ -295,16 +460,16 @@ GenerateProofsResult TEESecureDeletionAuditStrategy::generateProofs(
                   item.index) != file.deletedIndices.end();
     const auto &value = stale ? file.preDeleteValues[off] : file.values[off];
     M.assign(*std::static_pointer_cast<SM9CryptoData>(M + value));
-    auto tag = stale ? std::make_shared<SM9StaticTag>(
-                           std::make_shared<G1Point>(file.preDeleteTags[off]))
-                     : std::dynamic_pointer_cast<SM9StaticTag>(
-                           file.tags->getByIndex(off));
-    omega = omega ? std::dynamic_pointer_cast<SM9StaticTag>(*omega + *tag)
-                  : std::make_shared<SM9StaticTag>(tag->value);
+    auto tag =
+        stale ? std::make_shared<TeeTag>(
+                    std::make_shared<G1Point>(file.preDeleteTags[off]))
+              : std::dynamic_pointer_cast<TeeTag>(file.tags->getByIndex(off));
+    omega = omega ? std::dynamic_pointer_cast<TeeTag>(*omega + *tag)
+                  : std::make_shared<TeeTag>(tag->value);
   }
-  auto proof = std::make_shared<SM9StaticProves>();
+  auto proof = std::make_shared<TeeProof>();
   proof->muHat = M;
-  proof->Sigma = omega;
+  proof->sigma = omega;
   out.proves = proof;
   out.ext = ext;
   return out;
@@ -317,11 +482,9 @@ TEESecureDeletionAuditStrategy::verifyProofs(const VerifyProofsRequest &input) {
     return out;
   }
   auto ext = std::dynamic_pointer_cast<TeeVerifyExt>(input.ext);
-  auto q =
-      std::dynamic_pointer_cast<SM9StaticChallenges>(input.challenges.front());
-  auto proof = std::dynamic_pointer_cast<SM9StaticProves>(input.proves.front());
-  auto omega =
-      proof ? std::dynamic_pointer_cast<SM9StaticTag>(proof->Sigma) : nullptr;
+  auto q = std::dynamic_pointer_cast<TeeChallenges>(input.challenges.front());
+  auto proof = std::dynamic_pointer_cast<TeeProof>(input.proves.front());
+  auto omega = proof ? proof->sigma : nullptr;
   const auto found = files.find(ext ? ext->fileId : "");
   if (!ext || !ext->system || !ext->pub || !q || !proof || !omega ||
       !omega->value || found == files.end()) {

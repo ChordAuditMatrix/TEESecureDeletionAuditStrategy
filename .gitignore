@@ -25,6 +25,8 @@ CPackSourceConfig.cmake
 compile_commands.json
 Testing/
 benchmark-results/
+3rdparty/SM9StaticAuditStrategy/
+3rdparty/DHTDynamicAuditStrategy/
 
 # macOS
 .DS_Store

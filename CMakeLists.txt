@@ -49,26 +49,12 @@ endif()
 # ==================== Strategy Shared Library ====================
 set(SOURCE
   source/strategy.cpp
-  3rdparty/SM9StaticAuditStrategy/source/artifact_factory.cpp
-  3rdparty/SM9StaticAuditStrategy/source/common.cpp
-  3rdparty/SM9StaticAuditStrategy/source/challenges.cpp
-  3rdparty/SM9StaticAuditStrategy/source/generate_challenges.cpp
-  3rdparty/SM9StaticAuditStrategy/source/generate_keys.cpp
-  3rdparty/SM9StaticAuditStrategy/source/generate_proofs.cpp
-  3rdparty/SM9StaticAuditStrategy/source/generate_tags.cpp
-  3rdparty/SM9StaticAuditStrategy/source/initialize_algorithm.cpp
-  3rdparty/SM9StaticAuditStrategy/source/proves.cpp
-  3rdparty/SM9StaticAuditStrategy/source/tags.cpp
-  3rdparty/DHTDynamicAuditStrategy/source/state_stores/dynamic_hash_table_state_store.cpp
-  3rdparty/DHTDynamicAuditStrategy/source/state_stores/versioned_block_metadata.cpp
 )
 
 add_library(${PROJECT_NAME} SHARED ${SOURCE})
 target_link_libraries(${PROJECT_NAME} PRIVATE ChordAuditMatrixLib)
 target_include_directories(${PROJECT_NAME} PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/SM9StaticAuditStrategy/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/DHTDynamicAuditStrategy/include)
+    ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 if(CAM_BUILD_TESTS)
     enable_testing()
