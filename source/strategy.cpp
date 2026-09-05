@@ -33,8 +33,15 @@ public:
   G1Point u;
 
 protected:
-  void do_serialize(cereal::BinaryOutputArchive &) const override {}
-  void do_deserialize(cereal::BinaryInputArchive &) override {}
+  void do_serialize(cereal::BinaryOutputArchive &archive) const override {
+    const auto raw = u.toRawStruct();
+    archive(cereal::binary_data(&raw, sizeof(raw)));
+  }
+  void do_deserialize(cereal::BinaryInputArchive &archive) override {
+    CAMatrix::Crypto::SM9::SM9PointData raw;
+    archive(cereal::binary_data(&raw, sizeof(raw)));
+    u.setValue(raw);
+  }
 };
 class TeeUserPublic final : public AlgoPublicParams {
 public:
@@ -42,8 +49,20 @@ public:
   G2Point pk2;
 
 protected:
-  void do_serialize(cereal::BinaryOutputArchive &) const override {}
-  void do_deserialize(cereal::BinaryInputArchive &) override {}
+  void do_serialize(cereal::BinaryOutputArchive &archive) const override {
+    const auto raw1 = pk1.toRawStruct();
+    const auto raw2 = pk2.toRawStruct();
+    archive(cereal::binary_data(&raw1, sizeof(raw1)),
+            cereal::binary_data(&raw2, sizeof(raw2)));
+  }
+  void do_deserialize(cereal::BinaryInputArchive &archive) override {
+    CAMatrix::Crypto::SM9::SM9PointData raw1;
+    CAMatrix::Crypto::SM9::SM9PointData raw2;
+    archive(cereal::binary_data(&raw1, sizeof(raw1)),
+            cereal::binary_data(&raw2, sizeof(raw2)));
+    pk1.setValue(raw1);
+    pk2.setValue(raw2);
+  }
 };
 class TeeUserPrivate final : public AlgoPrivateParams {
 public:
@@ -51,8 +70,14 @@ public:
   SM9CryptoData sk2;
 
 protected:
-  void do_serialize(cereal::BinaryOutputArchive &) const override {}
-  void do_deserialize(cereal::BinaryInputArchive &) override {}
+  void do_serialize(cereal::BinaryOutputArchive &archive) const override {
+    archive(cereal::binary_data(sk1.data(), sk1.size()),
+            cereal::binary_data(sk2.data(), sk2.size()));
+  }
+  void do_deserialize(cereal::BinaryInputArchive &archive) override {
+    archive(cereal::binary_data(sk1.data(), sk1.size()),
+            cereal::binary_data(sk2.data(), sk2.size()));
+  }
 };
 
 class TeeTag final : public Tag {
@@ -113,13 +138,14 @@ public:
     SM9CryptoData coefficient;
   };
   std::vector<Item> items;
+  std::string fileId;
   std::size_t blockCount = 0;
   std::size_t challengeCount = 0;
   std::uint64_t seed = 0;
 
 protected:
   void do_serialize(cereal::BinaryOutputArchive &archive) const override {
-    archive(blockCount, challengeCount, seed);
+    archive(fileId, blockCount, challengeCount, seed);
     const auto count = items.size();
     archive(count);
     for (const auto &item : items) {
@@ -129,7 +155,7 @@ protected:
   }
 
   void do_deserialize(cereal::BinaryInputArchive &archive) override {
-    archive(blockCount, challengeCount, seed);
+    archive(fileId, blockCount, challengeCount, seed);
     std::size_t count = 0;
     archive(count);
     items.resize(count);
@@ -219,11 +245,9 @@ struct TeeChallengeExt final : StageExtBase {
   std::uint64_t seed = 0;
 };
 struct TeeProofExt final : StageExtBase {
-  std::string fileId;
   bool replay = false;
 };
 struct TeeVerifyExt final : StageExtBase {
-  std::string fileId;
   std::shared_ptr<TeeSystemPublic> system;
   std::shared_ptr<TeeUserPublic> pub;
 };
@@ -234,7 +258,6 @@ struct NativeDeletionFile {
   std::vector<std::size_t> deletedIndices;
 };
 std::map<std::string, NativeDeletionFile> files;
-std::string activeFileId;
 
 SM9CryptoData hashBlockToScalar(const CAMatrix::Crypto::CryptoArray &payload) {
   SM9CryptoData value;
@@ -359,9 +382,7 @@ TEESecureDeletionAuditStrategy::generateTags(const GenerateTagsRequest &input) {
   }
   file.tags = tags;
   files[ext->fileId] = file;
-  activeFileId = ext->fileId;
   out.tags = tags;
-  out.ext = ext;
   return out;
 }
 MaintainResult
@@ -402,9 +423,7 @@ TEESecureDeletionAuditStrategy::maintenance(const MaintainRequest &input) {
                   index) == file.deletedIndices.end())
       file.deletedIndices.push_back(index);
   }
-  activeFileId = ext->fileId;
   out.tags = file.tags;
-  out.ext = ext;
   return out;
 }
 GenerateChallengesResult TEESecureDeletionAuditStrategy::generateChallenges(
@@ -424,6 +443,7 @@ GenerateChallengesResult TEESecureDeletionAuditStrategy::generateChallenges(
                                                 ? ext->challengeCount
                                                 : selected.size()));
   auto q = std::make_shared<TeeChallenges>();
+  q->fileId = ext->fileId;
   q->blockCount = found->second.values.size();
   q->challengeCount = selected.size();
   q->seed = ext->seed;
@@ -434,7 +454,6 @@ GenerateChallengesResult TEESecureDeletionAuditStrategy::generateChallenges(
     q->items.push_back(item);
   }
   out.challenges = q;
-  out.ext = ext;
   return out;
 }
 GenerateProofsResult TEESecureDeletionAuditStrategy::generateProofs(
@@ -444,7 +463,7 @@ GenerateProofsResult TEESecureDeletionAuditStrategy::generateProofs(
   auto q = std::dynamic_pointer_cast<TeeChallenges>(input.challenges);
   if (!ext || !q || q->items.empty())
     return out;
-  const auto found = files.find(ext->fileId);
+  const auto found = files.find(q->fileId);
   if (found == files.end())
     return out;
   const auto &file = found->second;
@@ -471,7 +490,6 @@ GenerateProofsResult TEESecureDeletionAuditStrategy::generateProofs(
   proof->muHat = M;
   proof->sigma = omega;
   out.proves = proof;
-  out.ext = ext;
   return out;
 }
 VerifyProofsResult
@@ -485,7 +503,7 @@ TEESecureDeletionAuditStrategy::verifyProofs(const VerifyProofsRequest &input) {
   auto q = std::dynamic_pointer_cast<TeeChallenges>(input.challenges.front());
   auto proof = std::dynamic_pointer_cast<TeeProof>(input.proves.front());
   auto omega = proof ? proof->sigma : nullptr;
-  const auto found = files.find(ext ? ext->fileId : "");
+  const auto found = files.find(q ? q->fileId : "");
   if (!ext || !ext->system || !ext->pub || !q || !proof || !omega ||
       !omega->value || found == files.end()) {
     out.reason = "invalid TEE deletion evidence";
@@ -498,7 +516,7 @@ TEESecureDeletionAuditStrategy::verifyProofs(const VerifyProofsRequest &input) {
       out.reason = "invalid deletion index";
       return out;
     }
-    hashes.assign(add(hashes, h2(ext->fileId, item.index,
+    hashes.assign(add(hashes, h2(q->fileId, item.index,
                                  found->second.values[item.index - 1])));
   }
   SM9GTElement left, first, second;
@@ -517,12 +535,10 @@ TEESecureDeletionAuditStrategy::createRequest(AuditOperation op,
   switch (op) {
   case AuditOperation::AlgorithmInit: {
     auto r = std::make_shared<InitializeAlgorithmRequest>();
-    r->ext = std::make_shared<StageExtBase>();
     return std::make_shared<AuditRequestVariant>(r);
   }
   case AuditOperation::KeyGeneration: {
     auto r = std::make_shared<GenerateKeysRequest>();
-    r->ext = std::make_shared<StageExtBase>();
     return std::make_shared<AuditRequestVariant>(r);
   }
   case AuditOperation::GenerateTags: {
@@ -546,7 +562,9 @@ TEESecureDeletionAuditStrategy::createRequest(AuditOperation op,
     auto r = std::make_shared<MaintainRequest>();
     r->type = MaintenanceOpType::Delete;
     auto ext = std::make_shared<TeeMaintainExt>();
-    ext->fileId = root.get("fileId", activeFileId).asString();
+    ext->fileId = root.get("fileId", "").asString();
+    if (ext->fileId.empty())
+      throw std::runtime_error("TEE deletion maintenance requires fileId");
     ext->indices = indices(root);
     ext->seed = root.get("seed", ext->fileId + ":seed").asString();
     ext->system = std::dynamic_pointer_cast<TeeSystemPublic>(
@@ -561,7 +579,9 @@ TEESecureDeletionAuditStrategy::createRequest(AuditOperation op,
     const auto root = input.requireJson(op);
     auto r = std::make_shared<GenerateChallengesRequest>();
     auto ext = std::make_shared<TeeChallengeExt>();
-    ext->fileId = root.get("fileId", activeFileId).asString();
+    ext->fileId = root.get("fileId", "").asString();
+    if (ext->fileId.empty())
+      throw std::runtime_error("TEE deletion challenge requires fileId");
     ext->challengeCount =
         static_cast<std::size_t>(root.get("challengeCount", 0).asUInt64());
     ext->seed = root.get("seed", 42).asUInt64();
@@ -574,19 +594,16 @@ TEESecureDeletionAuditStrategy::createRequest(AuditOperation op,
     auto r = std::make_shared<GenerateProofsRequest>();
     r->challenges = ctx.generateChallengesResult->challenges;
     auto ext = std::make_shared<TeeProofExt>();
-    ext->fileId = activeFileId;
     auto data = input.requireCustom<AuditDataMap>(op);
     ext->replay = data->getOptional<bool>("adversarialReplay").value_or(false);
     r->ext = ext;
     return std::make_shared<AuditRequestVariant>(r);
   }
   case AuditOperation::ProofVerify: {
-    const auto root = input.requireJson(op);
     auto r = std::make_shared<VerifyProofsRequest>();
     r->challenges = {ctx.generateChallengesResult->challenges};
     r->proves = {ctx.generateProofsResult->proves};
     auto ext = std::make_shared<TeeVerifyExt>();
-    ext->fileId = root.get("fileId", activeFileId).asString();
     ext->system = std::dynamic_pointer_cast<TeeSystemPublic>(
         ctx.initializeAlgorithmResult->publicParams);
     ext->pub = std::dynamic_pointer_cast<TeeUserPublic>(
