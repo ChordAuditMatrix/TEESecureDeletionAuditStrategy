@@ -9,6 +9,8 @@
 *.so.*
 #*.dll
 *.dylib
+!release/
+!release/*.dylib
 
 # CMake build artifacts
 build/
