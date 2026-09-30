@@ -236,6 +236,7 @@ struct TeeMaintainExt final : StageExtBase {
   std::string fileId;
   std::vector<std::size_t> indices;
   std::string seed;
+  bool deletionMode = false;
   std::shared_ptr<TeeSystemPublic> system;
   std::shared_ptr<TeeUserPrivate> priv;
 };
@@ -389,8 +390,10 @@ MaintainResult
 TEESecureDeletionAuditStrategy::maintenance(const MaintainRequest &input) {
   MaintainResult out;
   auto ext = std::dynamic_pointer_cast<TeeMaintainExt>(input.ext);
-  if (!ext || input.type != MaintenanceOpType::Delete || !ext->system ||
-      !ext->priv)
+  if (!ext || !ext->deletionMode ||
+      (input.type != MaintenanceOpType::Delete &&
+       input.type != MaintenanceOpType::Update) ||
+      !ext->system || !ext->priv)
     return out;
   auto found = files.find(ext->fileId);
   if (found == files.end())
@@ -579,8 +582,26 @@ TEESecureDeletionAuditStrategy::createRequest(AuditOperation op,
   case AuditOperation::Maintenance: {
     const auto root = input.requireJson(op);
     auto r = std::make_shared<MaintainRequest>();
-    r->type = MaintenanceOpType::Delete;
+    const auto requestedType = static_cast<MaintenanceOpType>(
+        root.get("opType", static_cast<unsigned>(MaintenanceOpType::Delete))
+            .asUInt());
+    if (requestedType != MaintenanceOpType::Delete &&
+        requestedType != MaintenanceOpType::Update) {
+      throw std::runtime_error(
+          "TEE deletion maintenance requires Delete or Update operation type");
+    }
     auto ext = std::make_shared<TeeMaintainExt>();
+    // A caller that cannot expose a distinct deletion endpoint may carry the
+    // irreversible transformation through CoreLib's standard Update stage.
+    // Explicit Delete remains backwards compatible; Update must opt in so an
+    // ordinary dynamic-data update can never be mistaken for secure deletion.
+    ext->deletionMode = requestedType == MaintenanceOpType::Delete ||
+                        root.get("deletionMode", false).asBool();
+    if (!ext->deletionMode) {
+      throw std::runtime_error(
+          "TEE Update maintenance requires deletionMode=true");
+    }
+    r->type = requestedType;
     ext->fileId = root.get("fileId", "").asString();
     if (ext->fileId.empty())
       throw std::runtime_error("TEE deletion maintenance requires fileId");
@@ -590,7 +611,8 @@ TEESecureDeletionAuditStrategy::createRequest(AuditOperation op,
         ctx.initializeAlgorithmResult->publicParams);
     ext->priv = std::dynamic_pointer_cast<TeeUserPrivate>(
         ctx.generateKeysResult->privateParams);
-    r->tags = ctx.generateTagsResult->tags;
+    if (ctx.generateTagsResult)
+      r->tags = ctx.generateTagsResult->tags;
     r->ext = ext;
     return std::make_shared<AuditRequestVariant>(r);
   }

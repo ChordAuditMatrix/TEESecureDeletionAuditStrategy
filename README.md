@@ -9,6 +9,30 @@ primitives.
 The key transform is a software model: real enclave key sealing, remote
 attestation and hardware isolation require a deployment-specific TEE service.
 
+## CoreLib lifecycle
+
+No Bench- or CoreLib-specific interface is required for a deletion audit.  A
+caller uses the normal lifecycle `TagGen -> Maintenance(Update) -> Challenge
+-> Proof -> Verify` in one `AuditEngine` process.  The Update request carries
+the deletion intent explicitly:
+
+```json
+{
+  "fileId": "object-001",
+  "opType": 0,
+  "deletionMode": true,
+  "targetBlockIndices": [3, 7, 11],
+  "seed": "deletion-round-001"
+}
+```
+
+`opType: 0` is CoreLib's `MaintenanceOpType::Update`.  Explicit `Delete`
+requests remain supported.  A normal Update without `deletionMode: true` is
+rejected, preventing ordinary dynamic-data updates from being treated as a
+secure deletion operation.  The same `AuditEngine` and plugin instance must
+remain alive through proof verification because this software TEE model keeps
+the deletion state in process memory.
+
 ## Build and test
 
 ```sh
