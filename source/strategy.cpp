@@ -509,20 +509,39 @@ TEESecureDeletionAuditStrategy::verifyProofs(const VerifyProofsRequest &input) {
     out.reason = "invalid TEE deletion evidence";
     return out;
   }
-  G1Point hashes;
-  hashes.setInfinity();
+  // A deletion audit can sample both transformed (deleted) and unchanged
+  // blocks.  A transformed tag contributes H2(..., od_i) under pk2, whereas
+  // an unchanged tag contributes H(fid, i) under pk1.  Treating every sampled
+  // block as transformed makes an honest proof fail whenever the challenge
+  // contains an untouched block.
+  G1Point deletedHashes;
+  G1Point unchangedHashes;
+  deletedHashes.setInfinity();
+  unchangedHashes.setInfinity();
   for (const auto &item : q->items) {
     if (item.index == 0 || item.index > found->second.values.size()) {
       out.reason = "invalid deletion index";
       return out;
     }
-    hashes.assign(add(hashes, h2(q->fileId, item.index,
-                                 found->second.values[item.index - 1])));
+    const bool wasDeleted =
+        std::find(found->second.deletedIndices.begin(),
+                  found->second.deletedIndices.end(),
+                  item.index) != found->second.deletedIndices.end();
+    if (wasDeleted) {
+      deletedHashes.assign(add(
+          deletedHashes,
+          h2(q->fileId, item.index,
+             found->second.values[item.index - 1])));
+    } else {
+      unchangedHashes.assign(
+          add(unchangedHashes, computeBlockHash(q->fileId, item.index)));
+    }
   }
   SM9GTElement left, first, second;
   left.pairing(*omega->value, G2Point::generator());
-  first.pairing(mul(ext->system->u, proof->muHat), ext->pub->pk1);
-  second.pairing(hashes, ext->pub->pk2);
+  first.pairing(add(unchangedHashes, mul(ext->system->u, proof->muHat)),
+                ext->pub->pk1);
+  second.pairing(deletedHashes, ext->pub->pk2);
   auto right = first * second;
   out.ok = right && (left == *right);
   out.reason = out.ok ? "" : "TEE deletion pairing equation rejected";
