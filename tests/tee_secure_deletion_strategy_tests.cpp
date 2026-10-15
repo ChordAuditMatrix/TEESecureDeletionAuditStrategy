@@ -12,6 +12,7 @@
 #include "ChordAuditMatrixLib/interfaces/audit/state_stores/dynamic_pdp_state_store.h"
 
 #include <cstdlib>
+#include <iostream>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -80,6 +81,7 @@ int main() {
       return EXIT_FAILURE;
     AuditOperationContext context;
     context.strategy = strategy;
+    context.stateStore = stateStore;
 
     engine->initializeAlgorithm(RawInput{}, context);
     engine->generateKeys(RawInput{}, context);
@@ -113,6 +115,15 @@ int main() {
     challengeInput["fileId"] = "tee-test-file";
     challengeInput["challengeCount"] = 4;
     challengeInput["seed"] = 20260930;
+    auto isolatedStore = engine->createStateStore(strategy);
+    AuditOperationContext isolatedContext = context;
+    isolatedContext.stateStore = isolatedStore;
+    engine->generateChallenges(jsonInput(challengeInput), isolatedContext);
+    if (!isolatedContext.generateChallengesResult ||
+        isolatedContext.generateChallengesResult->challenges) {
+      std::cerr << "ChallengeGen leaked state across StateStore instances\n";
+      return EXIT_FAILURE;
+    }
     engine->generateChallenges(jsonInput(challengeInput), context);
     if (!context.generateChallengesResult ||
         !context.generateChallengesResult->challenges)
