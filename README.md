@@ -29,9 +29,9 @@ the deletion intent explicitly:
 `opType: 0` is CoreLib's `MaintenanceOpType::Update`.  Explicit `Delete`
 requests remain supported.  A normal Update without `deletionMode: true` is
 rejected, preventing ordinary dynamic-data updates from being treated as a
-secure deletion operation.  The same `AuditEngine` and plugin instance must
-remain alive through proof verification because this software TEE model keeps
-the deletion state in process memory.
+secure deletion operation. TEE protocol state is scoped to the per-operation
+`DynamicPdpStateStore` carried by `AuditOperationContext`; applications can
+persist and restore its `BlockMetadataCollection` and TEE-specific `FileState`.
 
 ## Build and test
 
