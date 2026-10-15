@@ -4,6 +4,9 @@
 
 #include "TEESecureDeletionAuditStrategy/strategy.h"
 
+#include "TEESecureDeletionAuditStrategy/deletion_state_store.h"
+
+#include "ChordAuditMatrixLib/implementations/audit/state_stores/in_memory_block_metadata_collection.h"
 #include "ChordAuditMatrixLib/implementations/audit/data/memory_audit_block_source.h"
 #include "ChordAuditMatrixLib/interfaces/audit/engine.h"
 #include "ChordAuditMatrixLib/interfaces/audit/messages/audit_data_map.h"
@@ -11,6 +14,7 @@
 #include "ChordAuditMatrixLib/interfaces/audit/operation_context.h"
 #include "ChordAuditMatrixLib/interfaces/audit/state_stores/dynamic_pdp_state_store.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <iostream>
 #include <memory>
@@ -48,18 +52,23 @@ bool verify(CAMatrix::Audit::Core::AuditEngine &engine,
   engine.verifyProofs(jsonInput(verifyInput), context);
   return context.verifyProofsResult && context.verifyProofsResult->ok;
 }
+
+int fail(const char *message) {
+  std::cerr << "TEE StateStore regression: " << message << '\n';
+  return EXIT_FAILURE;
+}
 } // namespace
 
 int main() {
   using Strategy = CAMatrix::Audit::Strategies::TEESecureDeletionAuditStrategy;
   try {
-    // Exercise the CoreLib store contract separately; TEE protocol state in
-    // this strategy remains process-scoped.
+    // Exercise CoreLib's per-operation state store contract and TEE protocol
+    // state ownership.
     auto engine = AuditEngineFactory::createInstance();
     auto strategy = std::make_shared<Strategy>();
     auto stateStore = engine->createStateStore(strategy);
     if (!stateStore)
-      return EXIT_FAILURE;
+      return fail("strategy did not create a StateStore");
     const std::string stateFileId = "tee-store-contract-file";
     stateStore->addFile(stateFileId);
     bool duplicateFileRejected = false;
@@ -69,7 +78,7 @@ int main() {
       duplicateFileRejected = true;
     }
     if (!duplicateFileRejected)
-      return EXIT_FAILURE;
+      return fail("duplicate file was accepted");
     const auto collection = stateStore->getBlockMetadataCollection(stateFileId);
     bool missingFileRejected = false;
     try {
@@ -78,7 +87,7 @@ int main() {
       missingFileRejected = true;
     }
     if (!missingFileRejected)
-      return EXIT_FAILURE;
+      return fail("metadata collection injection accepted an unknown file");
     AuditOperationContext context;
     context.strategy = strategy;
     context.stateStore = stateStore;
@@ -96,7 +105,14 @@ int main() {
     tagInput->emplace("userId", std::string("tee-test-user"));
     engine->generateTags(RawInput(tagInput), context);
     if (!context.generateTagsResult || !context.generateTagsResult->tags)
-      return EXIT_FAILURE;
+      return fail("TagGen failed");
+    const auto taggedFileState =
+        std::dynamic_pointer_cast<
+            CAMatrix::Audit::Strategies::TEEDeletion::DeletionFileState>(
+            stateStore->getFileState("tee-test-file"));
+    if (!taggedFileState || taggedFileState->values.size() != 4 ||
+        taggedFileState->tags.size() != 4)
+      return fail("TagGen did not persist TEE FileState through StateStore");
 
     // Secure deletion is intentionally transported through the normal dynamic
     // Update operation, without a Bench- or CoreLib-specific API.
@@ -108,8 +124,19 @@ int main() {
     updateInput["targetBlockIndices"] = Json::Value(Json::arrayValue);
     updateInput["targetBlockIndices"].append(2);
     engine->maintain(jsonInput(updateInput), context);
-    if (!context.maintainResult || !context.maintainResult->tags)
-      return EXIT_FAILURE;
+    if (!context.maintainResult)
+      return fail("Maintenance produced no result");
+    if (!context.maintainResult->tags)
+      return fail("Maintenance returned no tags");
+    const auto maintainedFileState =
+        std::dynamic_pointer_cast<
+            CAMatrix::Audit::Strategies::TEEDeletion::DeletionFileState>(
+            stateStore->getFileState("tee-test-file"));
+    if (!maintainedFileState ||
+        std::find(maintainedFileState->deletedIndices.begin(),
+                  maintainedFileState->deletedIndices.end(), 2) ==
+            maintainedFileState->deletedIndices.end())
+      return fail("Maintenance did not persist the deletion state");
 
     Json::Value challengeInput;
     challengeInput["fileId"] = "tee-test-file";
@@ -121,18 +148,51 @@ int main() {
     engine->generateChallenges(jsonInput(challengeInput), isolatedContext);
     if (!isolatedContext.generateChallengesResult ||
         isolatedContext.generateChallengesResult->challenges) {
-      std::cerr << "ChallengeGen leaked state across StateStore instances\n";
-      return EXIT_FAILURE;
+      return fail("ChallengeGen leaked state across StateStore instances");
     }
-    engine->generateChallenges(jsonInput(challengeInput), context);
-    if (!context.generateChallengesResult ||
-        !context.generateChallengesResult->challenges)
-      return EXIT_FAILURE;
+    const auto metadataBytes =
+        stateStore->getBlockMetadataCollection("tee-test-file")->serialize();
+    const auto fileStateBytes =
+        stateStore->getFileState("tee-test-file")->serialize();
+    auto restoredStore = engine->createStateStore(strategy);
+    restoredStore->addFile("tee-test-file");
+    auto restoredCollection =
+        std::make_shared<CAMatrix::Audit::Core::InMemoryBlockMetadataCollection>(
+            [] {
+              return std::make_shared<
+                  CAMatrix::Audit::Strategies::TEEDeletion::DeletionBlockMetadata>();
+            });
+    if (!restoredCollection->deserialize(metadataBytes))
+      return fail("metadata collection did not deserialize");
+    restoredStore->setBlockMetadataCollection("tee-test-file",
+                                               restoredCollection);
+    auto restoredFileState = restoredStore->createFileState();
+    if (!restoredFileState || !restoredFileState->deserialize(fileStateBytes))
+      return fail("TEE FileState did not deserialize");
+    restoredStore->setFileState("tee-test-file", restoredFileState);
+    if (restoredStore->getBlockCount("tee-test-file") != 4)
+      return fail("restored block metadata count changed");
+    AuditOperationContext restoredContext = context;
+    restoredContext.stateStore = restoredStore;
+    engine->generateChallenges(jsonInput(challengeInput), restoredContext);
+    if (!restoredContext.generateChallengesResult ||
+        !restoredContext.generateChallengesResult->challenges)
+      return fail("ChallengeGen failed after StateStore restore");
 
-    if (!verify(*engine, context, false))
-      return EXIT_FAILURE;
-    return verify(*engine, context, true) ? EXIT_FAILURE : EXIT_SUCCESS;
-  } catch (...) {
+    if (!verify(*engine, restoredContext, false))
+      return fail("deletion proof failed after StateStore restore");
+    if (verify(*engine, restoredContext, true))
+      return fail("replayed deletion proof was accepted");
+    restoredStore->removeFile("tee-test-file");
+    if (restoredStore->hasFile("tee-test-file") ||
+        restoredStore->getFileState("tee-test-file"))
+      return fail("removeFile retained TEE protocol state");
+    return EXIT_SUCCESS;
+  } catch (const std::exception &exception) {
+    std::cerr << "TEE StateStore regression threw: " << exception.what() << '\n';
     return EXIT_FAILURE;
-  }
+  } catch (...) {
+    std::cerr << "TEE StateStore regression threw an unknown exception\n";
+    return EXIT_FAILURE;
+}
 }

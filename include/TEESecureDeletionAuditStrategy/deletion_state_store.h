@@ -7,7 +7,10 @@
 #include "ChordAuditMatrixLib/interfaces/audit/state_stores/dynamic_pdp_state_store.h"
 #include "ChordAuditMatrixLib/implementations/audit/state_stores/in_memory_block_metadata_collection.h"
 
+#include "ChordAuditMatrixLib/interfaces/crypto/types/data.h"
 #include <cereal/archives/binary.hpp>
+
+#include <cereal/types/vector.hpp>
 
 #include <chrono>
 #include <cstdint>
@@ -53,9 +56,30 @@ private:
   std::uint64_t updatedAt = now();
 };
 
+/** Serializable TEE protocol record owned by one file in a StateStore. */
+class DeletionFileState final : public CAMatrix::Audit::Core::FileState {
+public:
+  std::vector<CAMatrix::Crypto::CryptoArray> values;
+  std::vector<CAMatrix::Crypto::CryptoArray> preDeleteValues;
+  std::vector<CAMatrix::Crypto::CryptoArray> tags;
+  std::vector<CAMatrix::Crypto::CryptoArray> preDeleteTags;
+  std::vector<std::size_t> deletedIndices;
+
+protected:
+  void do_serialize(cereal::BinaryOutputArchive &archive) const override {
+    archive(values, preDeleteValues, tags, preDeleteTags, deletedIndices);
+  }
+
+  void do_deserialize(cereal::BinaryInputArchive &archive) override {
+    archive(values, preDeleteValues, tags, preDeleteTags, deletedIndices);
+  }
+};
+
+using DeletionFileStatePtr = std::shared_ptr<DeletionFileState>;
+
 /**
- * Implements CoreLib's per-operation dynamic metadata-store contract. TEE
- * protocol-specific deletion bookkeeping remains in strategy.cpp.
+ * Implements CoreLib's per-operation dynamic metadata and protocol-state
+ * contract. TEE protocol state is scoped to this store and file.
  */
 class DeletionStateStore final
     : public CAMatrix::Audit::Core::DynamicPdpStateStore {
@@ -68,21 +92,47 @@ public:
     if (files_.find(fileId) != files_.end())
       throw std::runtime_error("file already exists: " + fileId);
     files_.emplace(fileId, createCollection());
+    try {
+      fileStates_.emplace(fileId, std::make_shared<DeletionFileState>());
+    } catch (...) {
+      files_.erase(fileId);
+      throw;
+    }
   }
 
   void addFile(const std::string &fileId, std::size_t blockCount) override {
     if (blockCount == 0)
       throw std::invalid_argument("blockCount must be positive");
-    auto [it, inserted] = files_.emplace(fileId, createCollection());
-    if (!inserted)
-      throw std::runtime_error("file already exists: " + fileId);
+    addFile(fileId);
+    auto collection = get(fileId);
     for (std::size_t i = 0; i < blockCount; ++i)
-      it->second->set(i, factory_());
+      collection->set(i, factory_());
   }
 
   void removeFile(const std::string &fileId) override {
     if (files_.erase(fileId) == 0)
       throw std::runtime_error("file does not exist: " + fileId);
+    fileStates_.erase(fileId);
+  }
+
+  CAMatrix::Audit::Core::FileStatePtr
+  getFileState(const std::string &fileId) const override {
+    const auto it = fileStates_.find(fileId);
+    return it == fileStates_.end() ? nullptr : it->second;
+  }
+
+  void setFileState(const std::string &fileId,
+                    CAMatrix::Audit::Core::FileStatePtr state) override {
+    if (!hasFile(fileId))
+      throw std::runtime_error("file does not exist: " + fileId);
+    auto typed = std::dynamic_pointer_cast<DeletionFileState>(state);
+    if (!typed)
+      throw std::invalid_argument("invalid TEE deletion FileState");
+    fileStates_.at(fileId) = std::move(typed);
+  }
+
+  CAMatrix::Audit::Core::FileStatePtr createFileState() const override {
+    return std::make_shared<DeletionFileState>();
   }
 
   bool hasFile(const std::string &fileId) const override {
@@ -192,6 +242,7 @@ private:
   std::unordered_map<std::string,
                      CAMatrix::Audit::Core::BlockMetadataCollectionPtr>
       files_;
+  std::unordered_map<std::string, DeletionFileStatePtr> fileStates_;
   CAMatrix::Audit::Core::BlockMetadataFactory factory_;
 };
 

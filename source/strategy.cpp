@@ -13,7 +13,6 @@
 #include <algorithm>
 #include <cereal/archives/binary.hpp>
 #include <json/json.h>
-#include <map>
 #include <numeric>
 #include <random>
 #include <stdexcept>
@@ -227,12 +226,14 @@ public:
   }
 };
 struct TeeTagsExt final : StageExtBase {
+  std::shared_ptr<DynamicPdpStateStore> stateStore;
   std::string fileId;
   std::shared_ptr<TeeSystemPublic> system;
   std::shared_ptr<TeeUserPublic> pub;
   std::shared_ptr<TeeUserPrivate> priv;
 };
 struct TeeMaintainExt final : StageExtBase {
+  std::shared_ptr<DynamicPdpStateStore> stateStore;
   std::string fileId;
   std::vector<std::size_t> indices;
   std::string seed;
@@ -241,14 +242,17 @@ struct TeeMaintainExt final : StageExtBase {
   std::shared_ptr<TeeUserPrivate> priv;
 };
 struct TeeChallengeExt final : StageExtBase {
+  std::shared_ptr<DynamicPdpStateStore> stateStore;
   std::string fileId;
   std::size_t challengeCount = 0;
   std::uint64_t seed = 0;
 };
 struct TeeProofExt final : StageExtBase {
+  std::shared_ptr<DynamicPdpStateStore> stateStore;
   bool replay = false;
 };
 struct TeeVerifyExt final : StageExtBase {
+  std::shared_ptr<DynamicPdpStateStore> stateStore;
   std::shared_ptr<TeeSystemPublic> system;
   std::shared_ptr<TeeUserPublic> pub;
 };
@@ -258,7 +262,79 @@ struct NativeDeletionFile {
   std::vector<G1Point> preDeleteTags;
   std::vector<std::size_t> deletedIndices;
 };
-std::map<std::string, NativeDeletionFile> files;
+CAMatrix::Crypto::CryptoArray
+serialize(const CAMatrix::Crypto::CryptoSerializable &value) {
+  return value.serialize();
+}
+
+template <class T>
+T deserialize(const CAMatrix::Crypto::CryptoArray &bytes) {
+  T value;
+  if (!value.deserialize(bytes))
+    throw std::runtime_error("invalid serialized TEE protocol state");
+  return value;
+}
+
+bool loadFile(const std::shared_ptr<DynamicPdpStateStore> &store,
+              const std::string &fileId, NativeDeletionFile &file) {
+  if (!store || !store->hasFile(fileId))
+    return false;
+  const auto state = std::dynamic_pointer_cast<TEEDeletion::DeletionFileState>(
+      store->getFileState(fileId));
+  if (!state || state->values.empty() ||
+      state->values.size() != store->getBlockCount(fileId) ||
+      state->values.size() != state->tags.size())
+    return false;
+  try {
+    for (const auto &bytes : state->values)
+      file.values.push_back(deserialize<SM9CryptoData>(bytes));
+    for (const auto &bytes : state->preDeleteValues)
+      file.preDeleteValues.push_back(deserialize<SM9CryptoData>(bytes));
+    auto tags =
+        std::make_shared<InMemoryTags>([] { return std::make_shared<TeeTag>(); });
+    for (std::size_t i = 0; i < state->tags.size(); ++i) {
+      auto point = std::make_shared<G1Point>();
+      if (!point->deserialize(state->tags[i]))
+        return false;
+      tags->set(i, std::make_shared<TeeTag>(std::move(point)));
+    }
+    file.tags = tags;
+    for (const auto &bytes : state->preDeleteTags)
+      file.preDeleteTags.push_back(deserialize<G1Point>(bytes));
+    file.deletedIndices = state->deletedIndices;
+  } catch (const std::exception &) {
+    return false;
+  }
+  return true;
+}
+
+bool saveFile(const std::shared_ptr<DynamicPdpStateStore> &store,
+              const std::string &fileId, const NativeDeletionFile &file) {
+  if (!store || !store->hasFile(fileId) || !file.tags ||
+      file.values.size() != store->getBlockCount(fileId) ||
+      file.tags->size() != file.values.size())
+    return false;
+  auto state = std::dynamic_pointer_cast<TEEDeletion::DeletionFileState>(
+      store->createFileState());
+  if (!state)
+    return false;
+  for (const auto &value : file.values)
+    state->values.push_back(serialize(value));
+  for (const auto &value : file.preDeleteValues)
+    state->preDeleteValues.push_back(serialize(value));
+  for (std::size_t i = 0; i < file.tags->size(); ++i) {
+    const auto tag =
+        std::dynamic_pointer_cast<TeeTag>(file.tags->getByIndex(i));
+    if (!tag || !tag->value)
+      return false;
+    state->tags.push_back(serialize(*tag->value));
+  }
+  for (const auto &tag : file.preDeleteTags)
+    state->preDeleteTags.push_back(serialize(tag));
+  state->deletedIndices = file.deletedIndices;
+  store->setFileState(fileId, state);
+  return true;
+}
 
 SM9CryptoData hashBlockToScalar(const CAMatrix::Crypto::CryptoArray &payload) {
   SM9CryptoData value;
@@ -366,24 +442,42 @@ GenerateTagsResult
 TEESecureDeletionAuditStrategy::generateTags(const GenerateTagsRequest &input) {
   GenerateTagsResult out;
   auto ext = std::dynamic_pointer_cast<TeeTagsExt>(input.ext);
-  if (!ext || !input.blocks || !ext->system || !ext->priv)
+  if (!ext || !input.blocks || !ext->system || !ext->priv ||
+      !ext->stateStore)
     return out;
-  auto tags =
-      std::make_shared<InMemoryTags>([] { return std::make_shared<TeeTag>(); });
+  const auto blockCount = input.blocks->availableBlockCount();
+  if (blockCount == 0)
+    return out;
+  if (!ext->stateStore->hasFile(ext->fileId)) {
+    ext->stateStore->addFile(ext->fileId, blockCount);
+  } else {
+    const auto storedCount = ext->stateStore->getBlockCount(ext->fileId);
+    if (storedCount != 0 && storedCount != blockCount)
+      return out;
+    if (storedCount == 0) {
+      for (std::size_t i = 0; i < blockCount; ++i)
+        ext->stateStore->insertBlock(ext->fileId, i + 1);
+    }
+  }
+  if (!std::dynamic_pointer_cast<TEEDeletion::DeletionFileState>(
+          ext->stateStore->getFileState(ext->fileId)))
+    return out;
   NativeDeletionFile file;
-  for (std::size_t offset = 0; offset < input.blocks->availableBlockCount();
-       ++offset) {
+  file.tags =
+      std::make_shared<InMemoryTags>([] { return std::make_shared<TeeTag>(); });
+  for (std::size_t offset = 0; offset < blockCount; ++offset) {
     const auto value = hashBlockToScalar(
         CAMatrix::Crypto::CryptoArray(input.blocks->block(offset)));
     const auto msg = add(computeBlockHash(ext->fileId, offset + 1),
                          mul(ext->system->u, value));
-    tags->set(offset, std::make_shared<TeeTag>(
-                          std::make_shared<G1Point>(mul(msg, ext->priv->sk1))));
+    file.tags->set(offset, std::make_shared<TeeTag>(
+                               std::make_shared<G1Point>(
+                                   mul(msg, ext->priv->sk1))));
     file.values.push_back(value);
   }
-  file.tags = tags;
-  files[ext->fileId] = file;
-  out.tags = tags;
+  if (!saveFile(ext->stateStore, ext->fileId, file))
+    return out;
+  out.tags = file.tags;
   return out;
 }
 MaintainResult
@@ -393,12 +487,11 @@ TEESecureDeletionAuditStrategy::maintenance(const MaintainRequest &input) {
   if (!ext || !ext->deletionMode ||
       (input.type != MaintenanceOpType::Delete &&
        input.type != MaintenanceOpType::Update) ||
-      !ext->system || !ext->priv)
+      !ext->system || !ext->priv || !ext->stateStore)
     return out;
-  auto found = files.find(ext->fileId);
-  if (found == files.end())
+  NativeDeletionFile file;
+  if (!loadFile(ext->stateStore, ext->fileId, file))
     return out;
-  auto &file = found->second;
   file.preDeleteValues = file.values;
   file.preDeleteTags.clear();
   for (std::size_t offset = 0; offset < file.values.size(); ++offset) {
@@ -426,6 +519,8 @@ TEESecureDeletionAuditStrategy::maintenance(const MaintainRequest &input) {
                   index) == file.deletedIndices.end())
       file.deletedIndices.push_back(index);
   }
+  if (!saveFile(ext->stateStore, ext->fileId, file))
+    return out;
   out.tags = file.tags;
   return out;
 }
@@ -435,10 +530,11 @@ GenerateChallengesResult TEESecureDeletionAuditStrategy::generateChallenges(
   auto ext = std::dynamic_pointer_cast<TeeChallengeExt>(input.ext);
   if (!ext)
     return out;
-  const auto found = files.find(ext->fileId);
-  if (found == files.end() || found->second.deletedIndices.empty())
+  NativeDeletionFile file;
+  if (!loadFile(ext->stateStore, ext->fileId, file) ||
+      file.deletedIndices.empty())
     return out;
-  std::vector<std::size_t> selected(found->second.values.size());
+  std::vector<std::size_t> selected(file.values.size());
   std::iota(selected.begin(), selected.end(), 1);
   std::mt19937_64 rng(ext->seed);
   std::shuffle(selected.begin(), selected.end(), rng);
@@ -447,7 +543,7 @@ GenerateChallengesResult TEESecureDeletionAuditStrategy::generateChallenges(
                                                 : selected.size()));
   auto q = std::make_shared<TeeChallenges>();
   q->fileId = ext->fileId;
-  q->blockCount = found->second.values.size();
+  q->blockCount = file.values.size();
   q->challengeCount = selected.size();
   q->seed = ext->seed;
   for (const auto index : selected) {
@@ -466,10 +562,9 @@ GenerateProofsResult TEESecureDeletionAuditStrategy::generateProofs(
   auto q = std::dynamic_pointer_cast<TeeChallenges>(input.challenges);
   if (!ext || !q || q->items.empty())
     return out;
-  const auto found = files.find(q->fileId);
-  if (found == files.end())
+  NativeDeletionFile file;
+  if (!loadFile(ext->stateStore, q->fileId, file))
     return out;
-  const auto &file = found->second;
   SM9CryptoData M;
   std::shared_ptr<TeeTag> omega;
   for (const auto &item : q->items) {
@@ -480,6 +575,9 @@ GenerateProofsResult TEESecureDeletionAuditStrategy::generateProofs(
         ext->replay &&
         std::find(file.deletedIndices.begin(), file.deletedIndices.end(),
                   item.index) != file.deletedIndices.end();
+    if (stale && (off >= file.preDeleteValues.size() ||
+                  off >= file.preDeleteTags.size()))
+      return out;
     const auto &value = stale ? file.preDeleteValues[off] : file.values[off];
     M.assign(*std::static_pointer_cast<SM9CryptoData>(M + value));
     auto tag =
@@ -506,9 +604,9 @@ TEESecureDeletionAuditStrategy::verifyProofs(const VerifyProofsRequest &input) {
   auto q = std::dynamic_pointer_cast<TeeChallenges>(input.challenges.front());
   auto proof = std::dynamic_pointer_cast<TeeProof>(input.proves.front());
   auto omega = proof ? proof->sigma : nullptr;
-  const auto found = files.find(q ? q->fileId : "");
+  NativeDeletionFile file;
   if (!ext || !ext->system || !ext->pub || !q || !proof || !omega ||
-      !omega->value || found == files.end()) {
+      !omega->value || !loadFile(ext->stateStore, q->fileId, file)) {
     out.reason = "invalid TEE deletion evidence";
     return out;
   }
@@ -522,19 +620,18 @@ TEESecureDeletionAuditStrategy::verifyProofs(const VerifyProofsRequest &input) {
   deletedHashes.setInfinity();
   unchangedHashes.setInfinity();
   for (const auto &item : q->items) {
-    if (item.index == 0 || item.index > found->second.values.size()) {
+    if (item.index == 0 || item.index > file.values.size()) {
       out.reason = "invalid deletion index";
       return out;
     }
     const bool wasDeleted =
-        std::find(found->second.deletedIndices.begin(),
-                  found->second.deletedIndices.end(),
-                  item.index) != found->second.deletedIndices.end();
+        std::find(file.deletedIndices.begin(), file.deletedIndices.end(),
+                  item.index) != file.deletedIndices.end();
     if (wasDeleted) {
       deletedHashes.assign(add(
           deletedHashes,
           h2(q->fileId, item.index,
-             found->second.values[item.index - 1])));
+             file.values[item.index - 1])));
     } else {
       unchangedHashes.assign(
           add(unchangedHashes, computeBlockHash(q->fileId, item.index)));
@@ -569,6 +666,7 @@ TEESecureDeletionAuditStrategy::createRequest(AuditOperation op,
     auto data = input.requireCustom<AuditDataMap>(op);
     r->blocks = data->getRequired<
         std::shared_ptr<CAMatrix::Audit::Data::AuditBlockSource>>("blocks");
+    ext->stateStore = ctx.stateStore;
     ext->fileId = data->getRequired<std::string>("fileId");
     ext->system = std::dynamic_pointer_cast<TeeSystemPublic>(
         ctx.initializeAlgorithmResult->publicParams);
@@ -602,6 +700,7 @@ TEESecureDeletionAuditStrategy::createRequest(AuditOperation op,
           "TEE Update maintenance requires deletionMode=true");
     }
     r->type = requestedType;
+    ext->stateStore = ctx.stateStore;
     ext->fileId = root.get("fileId", "").asString();
     if (ext->fileId.empty())
       throw std::runtime_error("TEE deletion maintenance requires fileId");
@@ -620,6 +719,7 @@ TEESecureDeletionAuditStrategy::createRequest(AuditOperation op,
     const auto root = input.requireJson(op);
     auto r = std::make_shared<GenerateChallengesRequest>();
     auto ext = std::make_shared<TeeChallengeExt>();
+    ext->stateStore = ctx.stateStore;
     ext->fileId = root.get("fileId", "").asString();
     if (ext->fileId.empty())
       throw std::runtime_error("TEE deletion challenge requires fileId");
@@ -635,6 +735,7 @@ TEESecureDeletionAuditStrategy::createRequest(AuditOperation op,
     auto r = std::make_shared<GenerateProofsRequest>();
     r->challenges = ctx.generateChallengesResult->challenges;
     auto ext = std::make_shared<TeeProofExt>();
+    ext->stateStore = ctx.stateStore;
     auto data = input.requireCustom<AuditDataMap>(op);
     ext->replay = data->getOptional<bool>("adversarialReplay").value_or(false);
     r->ext = ext;
@@ -645,6 +746,7 @@ TEESecureDeletionAuditStrategy::createRequest(AuditOperation op,
     r->challenges = {ctx.generateChallengesResult->challenges};
     r->proves = {ctx.generateProofsResult->proves};
     auto ext = std::make_shared<TeeVerifyExt>();
+    ext->stateStore = ctx.stateStore;
     ext->system = std::dynamic_pointer_cast<TeeSystemPublic>(
         ctx.initializeAlgorithmResult->publicParams);
     ext->pub = std::dynamic_pointer_cast<TeeUserPublic>(
