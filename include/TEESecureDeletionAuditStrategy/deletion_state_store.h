@@ -4,7 +4,7 @@
 #ifndef CAMATRIX_TEE_SECURE_DELETION_STATE_STORE_H
 #define CAMATRIX_TEE_SECURE_DELETION_STATE_STORE_H
 
-#include "ChordAuditMatrixLib/implementations/audit/state_stores/dynamic_pdp_state_store.h"
+#include "ChordAuditMatrixLib/interfaces/audit/state_stores/dynamic_pdp_state_store.h"
 #include "ChordAuditMatrixLib/implementations/audit/state_stores/in_memory_block_metadata_collection.h"
 
 #include <cereal/archives/binary.hpp>
@@ -54,8 +54,8 @@ private:
 };
 
 /**
- * Strategy-owned dynamic state store.  It is deliberately small and contains
- * no audit-scheme logic: cryptographic deletion state remains in strategy.cpp.
+ * Implements CoreLib's per-operation dynamic metadata-store contract. TEE
+ * protocol-specific deletion bookkeeping remains in strategy.cpp.
  */
 class DeletionStateStore final
     : public CAMatrix::Audit::Core::DynamicPdpStateStore {
@@ -65,6 +65,8 @@ public:
       : factory_(factory ? std::move(factory) : defaultFactory()) {}
 
   void addFile(const std::string &fileId) override {
+    if (files_.find(fileId) != files_.end())
+      throw std::runtime_error("file already exists: " + fileId);
     files_.emplace(fileId, createCollection());
   }
 
@@ -139,7 +141,10 @@ public:
       CAMatrix::Audit::Core::BlockMetadataCollectionPtr collection) override {
     if (!collection)
       throw std::invalid_argument("metadata collection must not be null");
-    files_.at(fileId) = std::move(collection);
+    const auto file = files_.find(fileId);
+    if (file == files_.end())
+      throw std::runtime_error("file does not exist: " + fileId);
+    file->second = std::move(collection);
   }
 
 private:

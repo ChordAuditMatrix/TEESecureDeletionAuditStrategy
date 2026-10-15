@@ -9,9 +9,11 @@
 #include "ChordAuditMatrixLib/interfaces/audit/messages/audit_data_map.h"
 #include "ChordAuditMatrixLib/interfaces/audit/messages/raw_input.h"
 #include "ChordAuditMatrixLib/interfaces/audit/operation_context.h"
+#include "ChordAuditMatrixLib/interfaces/audit/state_stores/dynamic_pdp_state_store.h"
 
 #include <cstdlib>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -50,9 +52,35 @@ bool verify(CAMatrix::Audit::Core::AuditEngine &engine,
 int main() {
   using Strategy = CAMatrix::Audit::Strategies::TEESecureDeletionAuditStrategy;
   try {
+    // Exercise the CoreLib store contract separately; TEE protocol state in
+    // this strategy remains process-scoped.
     auto engine = AuditEngineFactory::createInstance();
-    engine->setStrategy(std::make_shared<Strategy>());
+    auto strategy = std::make_shared<Strategy>();
+    auto stateStore = engine->createStateStore(strategy);
+    if (!stateStore)
+      return EXIT_FAILURE;
+    const std::string stateFileId = "tee-store-contract-file";
+    stateStore->addFile(stateFileId);
+    bool duplicateFileRejected = false;
+    try {
+      stateStore->addFile(stateFileId);
+    } catch (const std::runtime_error &) {
+      duplicateFileRejected = true;
+    }
+    if (!duplicateFileRejected)
+      return EXIT_FAILURE;
+    const auto collection = stateStore->getBlockMetadataCollection(stateFileId);
+    bool missingFileRejected = false;
+    try {
+      stateStore->setBlockMetadataCollection("missing-tee-file", collection);
+    } catch (const std::runtime_error &) {
+      missingFileRejected = true;
+    }
+    if (!missingFileRejected)
+      return EXIT_FAILURE;
     AuditOperationContext context;
+    context.strategy = strategy;
+
     engine->initializeAlgorithm(RawInput{}, context);
     engine->generateKeys(RawInput{}, context);
 
